@@ -1,19 +1,35 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const QRCode = require('qrcode');
+const uuid = require('uuid');
+const fs = require('fs');
+const path = require('path');
 const indiaRoutes = require('./india');
 const usaRoutes = require('./usa');
 
 const app = express();
 const PORT = 3000;
 
+// Create a directory for storing report data if it doesn't exist
+const REPORTS_DIR = path.join(__dirname, 'reports');
+if (!fs.existsSync(REPORTS_DIR)) {
+  fs.mkdirSync(REPORTS_DIR);
+}
+
 app.use(bodyParser.json());
 app.use('/india', indiaRoutes);
 app.use('/usa', usaRoutes);
+app.use(express.static('public'));
+
+
 
 app.get('/', (req, res) => {
   res.send('Export Compliance API is running!');
 });
+
+// Endpoint to serve the printable report and then delete the file
+
 
 app.post('/api/check-shipment-compliance', async (req, res) => {
     try {
@@ -138,16 +154,35 @@ app.post('/api/check-shipment-compliance', async (req, res) => {
         sourceCountry: shipmentData.sourceAddress?.country || "Not specified",
         destinationCountry: shipmentData.destinationAddress?.country || "Not specified",
         shipmentDate: shipmentData.shipmentDate,
+        shipmentId: shipmentData.shipmentId || uuid.v4(),
         totalItems: report.length,
         approvedItems: report.filter(item => item.status).length,
-        rejectedItems: report.filter(item => !item.status).length
+        rejectedItems: report.filter(item => !item.status).length,
+        generatedAt: new Date().toISOString()
       };
-  
-      res.json({
+      
+      const responseData = {
         status: overallStatus,
         summary: summary,
         report: report
-      });
+      };
+      
+      // Create a unique report ID and save the report data
+      const reportId = summary.shipmentId || uuid.v4();
+      fs.writeFileSync(
+        path.join(REPORTS_DIR, `${reportId}.json`), 
+        JSON.stringify(responseData, null, 2)
+      );
+      
+      // Generate QR code for the printable report
+      const reportUrl = `http://localhost:${PORT}/print-report/${reportId}`;
+      const qrCodeDataURL = await QRCode.toDataURL(reportUrl);
+      
+      // Add QR code to the response
+      responseData.qrCode = qrCodeDataURL;
+      responseData.printUrl = reportUrl;
+      
+      res.json(responseData);
     } catch (error) {
       console.error('Error processing shipment compliance:', error);
       res.status(500).json({
@@ -156,7 +191,7 @@ app.post('/api/check-shipment-compliance', async (req, res) => {
         errorMessage: error.message
       });
     }
-  });
+});
   
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
