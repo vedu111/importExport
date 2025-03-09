@@ -9,7 +9,7 @@ const { Worker, isMainThread, parentPort, workerData } = require('worker_threads
 const os = require('os');
 const router = express.Router();
 const embeddingsDatabase = require('./usa-embeddings-database.json');
-
+//okay that is new
 dotenv.config();
 
 // Initialize Express app
