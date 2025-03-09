@@ -11,7 +11,7 @@ const router = express.Router();
 const embeddingsDatabase = require('./usa-embeddings-database.json');
 //okay that is new
 dotenv.config();
-
+console.log()
 // Initialize Express app
 const app = express();
 const port = process.env.PORT || 3001;
