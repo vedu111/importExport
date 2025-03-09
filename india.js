@@ -5,18 +5,29 @@ const path = require('path');
 const bodyParser = require('body-parser');
 const pdfParse = require('pdf-parse');
 const dotenv = require('dotenv');
-const workerpool = require('workerpool'); 
-const router = express.Router();
-const embeddingsDatabase = require('./embeddings-database.json');
+const workerpool = require('workerpool');
+const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
 
 dotenv.config();
 
-// Initialize Express app
+// Initialize Express app and router
 const app = express();
+const router = express.Router();
 const port = process.env.PORT || 3000;
 
-// Configure middleware
-app.use(bodyParser.json());
+// File paths and API keys
+const PDF_PATH = path.join(__dirname, 'merge_pdf.pdf');
+const EMBEDDINGS_PATH = path.join(__dirname, 'embeddings-database.json');
+const ITEM_TO_HS_PATH = path.join(__dirname, 'USA-item-to-hs-mapping.json');
+
+// Load in-memory embeddings database if available
+let embeddingsDatabase = {};
+try {
+  embeddingsDatabase = require('./embeddings-database.json');
+} catch (err) {
+  console.warn('Embeddings database not found, starting with empty database.');
+}
 
 // Set up Gemini API
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyAGwF77rylskhbDu4WLNf0zSWTuVlNbr5A";
@@ -24,81 +35,134 @@ const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
 
-// File paths
-const PDF_PATH = path.join(__dirname, 'merge_pdf.pdf');
-const EMBEDDINGS_PATH = path.join(__dirname, 'embeddings-database.json');
-const ITEM_TO_HS_PATH = path.join(__dirname, 'USA-item-to-hs-mapping.json');
+// Configure middleware
+app.use(bodyParser.json());
 
-// Function to extract HS Codes from PDF content
+// Configure multer for file uploads (allow any file type)
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, 'uploads/');
+  },
+  filename: function (req, file, cb) {
+    const uniqueFileName = `${uuidv4()}-${file.originalname}`;
+    cb(null, uniqueFileName);
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
+
+// Create uploads directory if it doesn't exist
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+/**
+ * Function to extract HS Codes from the PDF text.
+ */
 function extractHSCodes(pdfText) {
   const hsCodeRegex = /(\d{8})\s+(.*?)(?:\s+)(Free|Restricted|Prohibited|Not Permitted)/gi;
   const hsCodesData = {};
   const itemToHsMap = {};
-  
+
   let match;
   while ((match = hsCodeRegex.exec(pdfText)) !== null) {
     const hsCode = match[1];
     const description = match[2].trim();
     const exportPolicy = match[3];
-    
+
     hsCodesData[hsCode] = {
       description,
       policy: exportPolicy
     };
-    
+
     const items = description.split(/[,;\/]/).map(item => item.trim().toLowerCase());
     items.forEach(item => {
       if (item.length > 3) {
         itemToHsMap[item] = hsCode;
       }
     });
-    
     itemToHsMap[description.toLowerCase()] = hsCode;
   }
-  
   return { hsCodesData, itemToHsMap };
 }
 
-// Updated function to generate embeddings with parallel processing
-async function generatePdfEmbeddings() {
-  try {
-    if (fs.existsSync(EMBEDDINGS_PATH) && fs.existsSync(ITEM_TO_HS_PATH)) {
-      console.log('Embeddings files already exist. Using existing data.');
-      const embeddingsData = JSON.parse(fs.readFileSync(EMBEDDINGS_PATH, 'utf8'));
-      const itemToHsMap = JSON.parse(fs.readFileSync(ITEM_TO_HS_PATH, 'utf8'));
-      return { ...embeddingsData, itemToHsMap };
-    }
+/**
+ * POST /api/upload-rules-pdf
+ * Accepts any file upload. If the file is a PDF, it processes it (extracting text, HS codes, chunking,
+ * and generating embeddings). For non-PDF files, it simply returns a success message.
+ */
+router.post('/api/upload-rules-pdf', upload.any(), async (req, res) => {
+  // Check that at least one file was uploaded
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({
+      status: false,
+      error: "No file uploaded"
+    });
+  }
 
-    console.log('Generating embeddings from PDF...');
-    
-    const dataBuffer = fs.readFileSync(PDF_PATH);
+  // Use the first file uploaded
+  const file = req.files[0];
+
+  // If the file is not a PDF, skip processing and return a message.
+  if (file.mimetype !== 'application/pdf') {
+    return res.json({
+      status: true,
+      message: "File uploaded successfully. Note: Processing is only applied to PDF files."
+    });
+  }
+
+  try {
+    console.log(`Processing uploaded PDF: ${file.filename}`);
+    const pdfPath = file.path;
+
+    // Read and parse the PDF file
+    const dataBuffer = fs.readFileSync(pdfPath);
     const pdfData = await pdfParse(dataBuffer);
     const pdfText = pdfData.text;
-    
-    console.log('Extracted PDF Text length:', pdfText.length); 
-    
-    const { hsCodesData, itemToHsMap } = extractHSCodes(pdfText);
-    
-    fs.writeFileSync(ITEM_TO_HS_PATH, JSON.stringify(itemToHsMap, null, 2));
-    console.log('Item to HS code mapping saved to file.');
-    
+    console.log('Extracted PDF Text length:', pdfText.length);
+
+    // Extract new HS codes and item-to-HS mappings from PDF text
+    const { hsCodesData: newHsCodesData, itemToHsMap: newItemToHsMap } = extractHSCodes(pdfText);
+
+    // Load existing data if available
+    let existingEmbeddingsData = {};
+    let existingItemToHsMap = {};
+    if (fs.existsSync(EMBEDDINGS_PATH)) {
+      existingEmbeddingsData = JSON.parse(fs.readFileSync(EMBEDDINGS_PATH, 'utf8'));
+    }
+    if (fs.existsSync(ITEM_TO_HS_PATH)) {
+      existingItemToHsMap = JSON.parse(fs.readFileSync(ITEM_TO_HS_PATH, 'utf8'));
+    }
+
+    // Merge HS code data and mappings
+    const mergedHsCodesData = {
+      ...(existingEmbeddingsData.hsCodesData || {}),
+      ...newHsCodesData
+    };
+    const mergedItemToHsMap = {
+      ...existingItemToHsMap,
+      ...newItemToHsMap
+    };
+
+    // Process the PDF text into chunks
     const chunkSize = 1000;
     const textChunks = [];
-    
     const paragraphs = pdfText.split('\n\n');
     let currentChunk = '';
-    
+
     for (const paragraph of paragraphs) {
       if ((currentChunk + paragraph).length > chunkSize) {
         if (currentChunk.length > 0) {
           textChunks.push(currentChunk.trim());
           currentChunk = '';
         }
-        
         if (paragraph.length > chunkSize) {
           const words = paragraph.split(' ');
           let subChunk = '';
-          
           for (const word of words) {
             if ((subChunk + ' ' + word).length > chunkSize) {
               textChunks.push(subChunk.trim());
@@ -107,7 +171,6 @@ async function generatePdfEmbeddings() {
               subChunk += ' ' + word;
             }
           }
-          
           if (subChunk.length > 0) {
             currentChunk = subChunk.trim();
           }
@@ -118,106 +181,123 @@ async function generatePdfEmbeddings() {
         currentChunk += '\n\n' + paragraph;
       }
     }
-    
     if (currentChunk.length > 0) {
       textChunks.push(currentChunk.trim());
     }
-    
-    // Create a worker pool
+
+    // Create a worker pool for parallel embedding generation
     const pool = workerpool.pool(path.join(__dirname, 'worker.js'));
-    
-    console.log(`Generating embeddings for ${textChunks.length} chunks...`);
-    
-    // Track progress
+    console.log(`Generating embeddings for ${textChunks.length} chunks from uploaded PDF...`);
+
     let completed = 0;
     const total = textChunks.length;
-    
-    // Generate embeddings in parallel
     const embeddingPromises = textChunks.map(async (chunk, index) => {
       try {
         const embedding = await pool.exec('generateEmbedding', [chunk]);
         completed++;
-        if (completed % 10 === 0) {
+        if (completed % 5 === 0) {
           console.log(`Processed ${completed} out of ${total} chunks`);
         }
-        return { id: index, content: chunk, embedding };
+        return {
+          id: index + (existingEmbeddingsData.chunks?.length || 0),
+          content: chunk,
+          embedding
+        };
       } catch (error) {
         console.error(`Error generating embedding for chunk ${index}:`, error);
         return null;
       }
     });
-    
-    const results = await Promise.all(embeddingPromises);
-    
-    const successfulChunks = results.filter(result => result !== null);
-    
-    if (successfulChunks.length < textChunks.length) {
-      console.warn(`Some chunks failed to generate embeddings. Processed ${successfulChunks.length} out of ${textChunks.length} chunks.`);
-    }
-    
-    const embeddingsDatabase = {
-      chunks: successfulChunks,
-      hsCodesData: hsCodesData
-    };
-    
-    fs.writeFileSync(EMBEDDINGS_PATH, JSON.stringify(embeddingsDatabase, null, 2));
-    console.log('Embeddings saved to file.');
-    
-    // Terminate the worker pool
-    await pool.terminate();
-    
-    return { ...embeddingsDatabase, itemToHsMap };
-  } catch (error) {
-    console.error('Error generating embeddings:', error);
-    throw error;
-  }
-}
 
-// Remaining functions (unchanged)
-async function findRelevantContent(query, embeddingsDatabase) {
-  try {
-    const queryEmbedResult = await embeddingModel.embedContent({
-      content: { parts: [{ text: query }] },
+    const results = await Promise.all(embeddingPromises);
+    const successfulChunks = results.filter(result => result !== null);
+
+    // Merge new chunks with existing ones and update the embeddings database
+    const mergedChunks = [
+      ...(existingEmbeddingsData.chunks || []),
+      ...successfulChunks
+    ];
+    const updatedEmbeddingsDatabase = {
+      chunks: mergedChunks,
+      hsCodesData: mergedHsCodesData
+    };
+
+    fs.writeFileSync(EMBEDDINGS_PATH, JSON.stringify(updatedEmbeddingsDatabase, null, 2));
+    fs.writeFileSync(ITEM_TO_HS_PATH, JSON.stringify(mergedItemToHsMap, null, 2));
+
+    // Update the in-memory database
+    embeddingsDatabase.chunks = updatedEmbeddingsDatabase.chunks;
+    embeddingsDatabase.hsCodesData = updatedEmbeddingsDatabase.hsCodesData;
+    embeddingsDatabase.itemToHsMap = mergedItemToHsMap;
+
+    // Terminate the worker pool and remove the temporary file
+    await pool.terminate();
+    fs.unlinkSync(pdfPath);
+
+    return res.json({
+      status: true,
+      message: "PDF processed and merged successfully",
+      stats: {
+        newHSCodesAdded: Object.keys(newHsCodesData).length,
+        newItemMappingsAdded: Object.keys(newItemToHsMap).length,
+        newTextChunksProcessed: successfulChunks.length,
+        totalHSCodes: Object.keys(mergedHsCodesData).length,
+        totalChunks: mergedChunks.length
+      }
     });
-    
-    const queryEmbedding = queryEmbedResult.embedding.values;
-    
-    const similarityScores = embeddingsDatabase.chunks.map(item => {
-      const similarity = cosineSimilarity(queryEmbedding, item.embedding);
-      return { ...item, similarity };
-    });
-    
-    const topResults = similarityScores
-      .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, 5);
-    
-    return topResults.map(item => item.content).join('\n\n');
   } catch (error) {
-    console.error('Error finding relevant content:', error);
-    throw error;
+    console.error('Error processing uploaded PDF:', error);
+    if (req.files && req.files[0] && fs.existsSync(req.files[0].path)) {
+      fs.unlinkSync(req.files[0].path);
+    }
+    return res.status(500).json({
+      status: false,
+      error: "An error occurred while processing the uploaded PDF",
+      message: error.message
+    });
   }
+});
+
+/**
+ * Helper Functions
+ */
+function cosineSimilarity(vecA, vecB) {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 function findHSCodeByItemName(itemName, itemToHsMap) {
   const normalizedItemName = itemName.toLowerCase().trim();
-  
   if (itemToHsMap[normalizedItemName]) {
     return itemToHsMap[normalizedItemName];
   }
-  
   const itemKeys = Object.keys(itemToHsMap);
-  
   const containsMatch = itemKeys.find(key => key.includes(normalizedItemName));
   if (containsMatch) {
     return itemToHsMap[containsMatch];
   }
-  
   const isContainedMatch = itemKeys.find(key => normalizedItemName.includes(key) && key.length > 5);
-  if (isContainedMatch) {
-    return itemToHsMap[isContainedMatch];
-  }
-  
-  return null;
+  return isContainedMatch ? itemToHsMap[isContainedMatch] : null;
+}
+
+function findHSCodeByDescription(description, hsCodesData) {
+  const normalizedDescription = description.toLowerCase().trim();
+  const matchingHsCode = Object.keys(hsCodesData).find(hsCode =>
+    hsCodesData[hsCode].description.toLowerCase() === normalizedDescription
+  );
+  if (matchingHsCode) return matchingHsCode;
+  const partialMatchHsCode = Object.keys(hsCodesData).find(hsCode =>
+    hsCodesData[hsCode].description.toLowerCase().includes(normalizedDescription) ||
+    normalizedDescription.includes(hsCodesData[hsCode].description.toLowerCase())
+  );
+  return partialMatchHsCode || null;
 }
 
 async function checkHSCodeCompliance(hsCode, embeddingsDatabase) {
@@ -230,17 +310,13 @@ async function checkHSCodeCompliance(hsCode, embeddingsDatabase) {
       description: hsData.description
     };
   }
-  
   if (hsCode.length >= 4) {
     const chapter = hsCode.substring(0, 4);
     const twoDigitChapter = hsCode.substring(0, 2);
-    
     const matchingCodes = Object.keys(embeddingsDatabase.hsCodesData || {})
       .filter(code => code.startsWith(chapter) || code.startsWith(twoDigitChapter));
-    
     if (matchingCodes.length > 0) {
       const policies = matchingCodes.map(code => embeddingsDatabase.hsCodesData[code].policy);
-      
       if (policies.some(policy => policy.toLowerCase() === 'free')) {
         return {
           exists: true,
@@ -258,17 +334,13 @@ async function checkHSCodeCompliance(hsCode, embeddingsDatabase) {
       }
     }
   }
-  
   try {
     const prompt = `Given HS code ${hsCode} that wasn't found in our database, provide a reason why this code might not be recognized. Limit your response to one short paragraph.`;
-    
     const result = await model.generateContent({
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: { maxOutputTokens: 100 }
     });
-    
     const dynamicReason = result.response.text();
-    
     return {
       exists: false,
       allowed: false,
@@ -284,68 +356,40 @@ async function checkHSCodeCompliance(hsCode, embeddingsDatabase) {
   }
 }
 
-function cosineSimilarity(vecA, vecB) {
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-  
-  for (let i = 0; i < vecA.length; i++) {
-    dotProduct += vecA[i] * vecB[i];
-    normA += vecA[i] * vecA[i];
-    normB += vecB[i] * vecB[i];
+async function findRelevantContent(query, embeddingsDatabase) {
+  try {
+    const queryEmbedResult = await embeddingModel.embedContent({
+      content: { parts: [{ text: query }] }
+    });
+    const queryEmbedding = queryEmbedResult.embedding.values;
+    const similarityScores = embeddingsDatabase.chunks.map(item => {
+      const similarity = cosineSimilarity(queryEmbedding, item.embedding);
+      return { ...item, similarity };
+    });
+    const topResults = similarityScores
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, 5);
+    return topResults.map(item => item.content).join('\n\n');
+  } catch (error) {
+    console.error('Error finding relevant content:', error);
+    throw error;
   }
-  
-  normA = Math.sqrt(normA);
-  normB = Math.sqrt(normB);
-  
-  return dotProduct / (normA * normB);
 }
 
-// Initialize embeddings database
-// let embeddingsDatabase = {
-//   chunks: [],
-//   hsCodesData: {},
-//   itemToHsMap: {}
-// };
-
-
-// Helper function to find HS code by description
-function findHSCodeByDescription(description, hsCodesData) {
-  const normalizedDescription = description.toLowerCase().trim();
-  
-  // Search through the HS codes data for an exact match
-  const matchingHsCode = Object.keys(hsCodesData).find(hsCode => 
-    hsCodesData[hsCode].description.toLowerCase() === normalizedDescription
-  );
-
-  if (matchingHsCode) {
-    return matchingHsCode;
-  }
-
-  // If no exact match, try partial match
-  const partialMatchHsCode = Object.keys(hsCodesData).find(hsCode => 
-    hsCodesData[hsCode].description.toLowerCase().includes(normalizedDescription) ||
-    normalizedDescription.includes(hsCodesData[hsCode].description.toLowerCase())
-  );
-
-  return partialMatchHsCode || null; // Return the partial match or null if none found
-}
-
-
-// POST /api/check-export-compliance
+/**
+ * POST /api/check-export-compliance
+ * Checks export compliance based on provided HS code, item name, or item description.
+ */
 router.post('/api/check-export-compliance', async (req, res) => {
   try {
     const { hsCode, itemWeight, material, itemName, itemManufacturer, itemDescription } = req.body;
-    
     if (!hsCode && !itemName && !itemDescription) {
       return res.status(400).json({
         status: false,
         error: "Missing required fields. Please provide either hsCode, itemName, or itemDescription"
       });
     }
-    
     let codeToCheck = hsCode;
-    
     if (!hsCode && itemName) {
       codeToCheck = findHSCodeByItemName(itemName, embeddingsDatabase.itemToHsMap);
       if (!codeToCheck) {
@@ -356,11 +400,9 @@ router.post('/api/check-export-compliance', async (req, res) => {
         });
       }
     }
-
     if (!hsCode && itemDescription) {
       const normalizedDescription = itemDescription.toLowerCase().trim();
       codeToCheck = findHSCodeByDescription(normalizedDescription, embeddingsDatabase.hsCodesData);
-      
       if (!codeToCheck) {
         try {
           const prompt = `Given the description "${normalizedDescription}" not found in USA import regulations, provide a short reason why this item is restricted for export.`;
@@ -368,7 +410,6 @@ router.post('/api/check-export-compliance', async (req, res) => {
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: { maxOutputTokens: 100 }
           });
-          
           return res.json({
             status: false,
             allowed: false,
@@ -386,9 +427,7 @@ router.post('/api/check-export-compliance', async (req, res) => {
         }
       }
     }
-    
     const hsCodeCompliance = await checkHSCodeCompliance(codeToCheck, embeddingsDatabase);
-    
     if (!hsCodeCompliance.exists) {
       return res.json({
         status: false,
@@ -398,7 +437,6 @@ router.post('/api/check-export-compliance', async (req, res) => {
         queriedItemName: itemName || null
       });
     }
-    
     if (hsCodeCompliance.allowed) {
       return res.json({
         status: true,
@@ -416,7 +454,6 @@ router.post('/api/check-export-compliance', async (req, res) => {
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: 100 }
         });
-        
         return res.json({
           status: false,
           allowed: false,
@@ -439,7 +476,6 @@ router.post('/api/check-export-compliance', async (req, res) => {
         });
       }
     }
-    
   } catch (error) {
     console.error('Error checking export compliance:', error);
     return res.status(500).json({
@@ -449,147 +485,45 @@ router.post('/api/check-export-compliance', async (req, res) => {
   }
 });
 
-// POST /api/find-by-description
+/**
+ * POST /api/find-by-description
+ * Finds an HS code based on the provided item description.
+ */
 router.post('/api/find-by-description', (req, res) => {
   try {
     const { description } = req.body;
-    
     if (!description) {
       return res.status(400).json({
         status: false,
         error: "Missing required field: description"
       });
     }
-    
     const normalizedDescription = description.toLowerCase().trim();
     const hsCodesData = embeddingsDatabase.hsCodesData || {};
-    
-    const matchingHsCode = Object.keys(hsCodesData).find(hsCode => 
+    const matchingHsCode = Object.keys(hsCodesData).find(hsCode =>
       hsCodesData[hsCode].description.toLowerCase() === normalizedDescription
     );
-    
     if (matchingHsCode) {
       return res.json({ hsCode: matchingHsCode });
     }
-    
-    const partialMatchHsCode = Object.keys(hsCodesData).find(hsCode => 
+    const partialMatchHsCode = Object.keys(hsCodesData).find(hsCode =>
       hsCodesData[hsCode].description.toLowerCase().includes(normalizedDescription) ||
       normalizedDescription.includes(hsCodesData[hsCode].description.toLowerCase())
     );
-    
     if (partialMatchHsCode) {
       return res.json({ status: true, hsCode: partialMatchHsCode, note: "Found via partial match" });
     }
-    
     return res.json({ status: false, error: "No matching HS code found for this description" });
-    
   } catch (error) {
     console.error('Error finding HS code by description:', error);
     return res.status(500).json({ status: false, error: "An error occurred while finding HS code" });
   }
 });
 
+// Mount the router and start the server
+app.use(router);
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
+
 module.exports = router;
-
-
-
-
-
-// // Initialize server
-// async function initServer() {
-//   try {
-//     embeddingsDatabase = await generatePdfEmbeddings();
-    
-//     app.listen(port, () => {
-//       console.log(`Export compliance API server running on port ${port}`);
-//       console.log(`Loaded ${embeddingsDatabase.chunks?.length || 0} embedded chunks from PDF`);
-//       console.log(`Extracted ${Object.keys(embeddingsDatabase.hsCodesData || {}).length} HS codes from PDF`);
-//       console.log(`Created ${Object.keys(embeddingsDatabase.itemToHsMap || {}).length} item to HS code mappings`);
-//     });
-//   } catch (error) {
-//     console.error('Failed to initialize server:', error);
-//     process.exit(1);
-//   }
-// }
-
-// // Start the server
-// initServer();
-
-
-
-
-
-
-// app.get('/api/hs-codes', (req, res) => {
-//   try {
-//     if (!embeddingsDatabase.hsCodesData) {
-//       return res.status(404).json({
-//         status: false,
-//         error: "HS Codes data not found. Please regenerate embeddings."
-//       });
-//     }
-    
-//     return res.json({
-//       status: true,
-//       count: Object.keys(embeddingsDatabase.hsCodesData).length,
-//       hsCodes: embeddingsDatabase.hsCodesData
-//     });
-//   } catch (error) {
-//     console.error('Error retrieving HS codes:', error);
-//     return res.status(500).json({
-//       status: false,
-//       error: "An error occurred while retrieving HS codes"
-//     });
-//   }
-// });
-
-// app.get('/api/item-to-hs-mapping', (req, res) => {
-//   try {
-//     if (!embeddingsDatabase.itemToHsMap) {
-//       return res.status(404).json({
-//         status: false,
-//         error: "Item to HS code mapping not found. Please regenerate embeddings."
-//       });
-//     }
-    
-//     return res.json({
-//       status: true,
-//       count: Object.keys(embeddingsDatabase.itemToHsMap).length,
-//       mapping: embeddingsDatabase.itemToHsMap
-//     });
-//   } catch (error) {
-//     console.error('Error retrieving item to HS mapping:', error);
-//     return res.status(500).json({
-//       status: false,
-//       error: "An error occurred while retrieving item to HS mapping"
-//     });
-//   }
-// });
-
-// app.post('/api/regenerate-embeddings', async (req, res) => {
-//   try {
-//     if (fs.existsSync(EMBEDDINGS_PATH)) {
-//       fs.unlinkSync(EMBEDDINGS_PATH);
-//     }
-    
-//     if (fs.existsSync(ITEM_TO_HS_PATH)) {
-//       fs.unlinkSync(ITEM_TO_HS_PATH);
-//     }
-    
-//     embeddingsDatabase = await generatePdfEmbeddings();
-    
-//     res.json({
-//       success: true,
-//       message: "Embeddings and item mapping regenerated successfully",
-//       chunksCount: embeddingsDatabase.chunks.length,
-//       hsCodesCount: Object.keys(embeddingsDatabase.hsCodesData || {}).length,
-//       itemMappingsCount: Object.keys(embeddingsDatabase.itemToHsMap || {}).length
-//     });
-//   } catch (error) {
-//     console.error('Error regenerating embeddings:', error);
-//     res.status(500).json({
-//       success: false,
-//       error: "Failed to regenerate embeddings"
-//     });
-//   }
-// });

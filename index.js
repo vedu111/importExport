@@ -7,9 +7,27 @@ const fs = require('fs');
 const path = require('path');
 const indiaRoutes = require('./india');
 const usaRoutes = require('./usa');
-
+const cors = require("cors")
 const app = express();
-const PORT = 3000;
+const PORT = 8000;
+
+
+app.use(cors({
+  origin: [
+    'http://localhost:3000', 
+    'http://localhost:5173',  // Add this origin
+    'https://l4-tct-deployment.vercel.app',
+    'http://127.0.0.1:5500',
+    'https://backend.thecatalysttree.com',
+    'https://frontend.thecatalysttree.com',
+    "https://www.thecatalysttree.com",
+    "https://thecatalysttree.com"
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+}));
+
 
 // Create a directory for storing report data if it doesn't exist
 const REPORTS_DIR = path.join(__dirname, 'reports');
