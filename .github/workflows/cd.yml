@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Pull Docker image
-        run: sudo docker pull thedoctor4644/vedu_backend:latest:latest
+        run: sudo docker pull thedoctor4644/vedu_backend:latest
 
       - name: Delete Old Docker Container
         run: sudo docker rm -f vedu_backend:latest-container || true
