@@ -1,0 +1,24 @@
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+
+jobs:
+  build:
+    runs-on: self-hosted
+
+    steps:
+      - name: Pull Docker image
+        run: sudo docker pull thedoctor4644/tct_backend_docker:latest
+
+      - name: Delete Old Docker Container
+        run: sudo docker rm -f tct_backend_docker-container || true
+
+      - name: Run Docker Container with Environment Variables
+        run: |
+          sudo docker run -d \
+            -p ${{ secrets.PORT }}:${{ secrets.PORT }} \
+            thedoctor4644/tct_backend_docker:latest
