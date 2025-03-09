@@ -12,13 +12,13 @@ jobs:
 
     steps:
       - name: Pull Docker image
-        run: sudo docker pull thedoctor4644/tct_backend_docker:latest
+        run: sudo docker pull thedoctor4644/vedu_backend:latest:latest
 
       - name: Delete Old Docker Container
-        run: sudo docker rm -f tct_backend_docker-container || true
+        run: sudo docker rm -f vedu_backend:latest-container || true
 
       - name: Run Docker Container with Environment Variables
         run: |
           sudo docker run -d \
             -p ${{ secrets.PORT }}:${{ secrets.PORT }} \
-            thedoctor4644/tct_backend_docker:latest
+            thedoctor4644/vedu_backend:latest:latest
