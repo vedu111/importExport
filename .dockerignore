@@ -1,0 +1,36 @@
+# Node modules (installed inside container)
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Environment files (contains secrets)
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Logs
+logs
+*.log
+debug.log
+yarn-debug.log
+yarn-error.log
+
+# Build files (frontend & backend)
+dist
+build
+
+# Editor/IDE Files
+.vscode
+.idea
+.DS_Store
+*.swp
+
+# Docker-related files
+.dockerignore
+docker-compose.override.yml
+
+# Git-related files
+.git
+.gitignore
